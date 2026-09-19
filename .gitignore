@@ -1,1 +1,19 @@
-venv
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Временные файлы редакторов
+*~
+*.swp
+*.bak
