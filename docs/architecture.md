@@ -390,3 +390,285 @@ sequenceDiagram
 как поле ключа только ухудшил бы распределение. Если кластер разъедется по регионам,
 к ключам `orders` и `carts` можно добавить префикс `geo_zone` и закрепить диапазоны
 за региональными шардами через `sh.addShardToZone` и `sh.updateZoneKeyRange`.
+
+## Задание 8. Выявление и устранение горячих шардов
+
+### Что произошло
+
+До перепроектирования коллекция `products` была шардирована диапазонно по `category`.
+У ключа низкая кардинальность, поэтому вся категория целиком лежит в одном чанке,
+а сам чанк невозможно разделить: у всех его документов одинаковое значение ключа.
+Электроника, на которую пришлось 70% запросов, оказалась на одном шарде вместе
+со всей своей нагрузкой.
+
+Балансировщик MongoDB в этой ситуации не помогает. Он выравнивает объём данных
+между шардами и ничего не знает о том, сколько запросов приходит в каждый чанк.
+Кластер с точки зрения балансировщика был исправен.
+
+Ситуация воспроизведена на стенде из `mongo-sharding`: 5000 товаров, из них 3500
+в категории `electronics`, ключ `{ category: 1 }`. Результат: один чанк со всеми
+документами на `shard1`, `sh.balancerCollectionStatus()` отвечает `balancerCompliant: true`.
+
+### Метрики
+
+Метрики собираются с каждого `mongod` шардов, с `mongos` и с config server. Для сбора
+подходит `mongodb_exporter` от Percona плюс Prometheus и Grafana, имена метрик
+в примерах ниже даны для него. Метрики делятся на три группы.
+
+**Нагрузка на шард**, источник `db.serverStatus()` на primary и secondary каждого шарда:
+
+| Метрика | Поле serverStatus | Порог тревоги | О чём говорит |
+| :- | :- | :- | :- |
+| Операции в секунду по типам | `opcounters.query`, `insert`, `update`, `delete`, `getmore` | доля шарда больше 1,5 средней доли 5 минут подряд | перекос нагрузки между шардами |
+| Средняя задержка операций | `opLatencies.reads`, `writes`: `latency / ops` | чтение больше 50 мс, запись больше 100 мс | шард не успевает обрабатывать очередь |
+| Очередь на исполнение | `queues.execution.read`, `write`: `available`, `queueLength`, `totalTimeQueuedMicros` | `available` равен 0 или растёт `queueLength` | закончились тикеты WiredTiger, операции ждут |
+| Соединения | `connections.current`, `available` | `current` больше 80% лимита | пул приложения упирается в шард |
+| Кеш WiredTiger | `wiredTiger.cache["bytes currently in the cache"]`, `"maximum bytes configured"`, `"pages read into cache"` | заполнение больше 95%, рост чтений с диска | рабочий набор шарда не помещается в память |
+| Отставание реплик | `replSetGetStatus`: разница `optimeDate` primary и secondary | больше 10 секунд | primary перегружен, secondary не успевают |
+| Ресурсы хоста | CPU, IOPS, задержка диска, сеть через node_exporter | CPU больше 80%, задержка диска больше 20 мс | железо шарда на пределе |
+
+**Распределение данных**, источник config server через `mongos`:
+
+| Метрика | Как получить | Порог тревоги | О чём говорит |
+| :- | :- | :- | :- |
+| Документы и байты по шардам | `db.aggregate([{ $shardedDataDistribution: {} }])` | доля шарда больше 1,5 средней | перекос данных |
+| Чанки по шардам и jumbo-чанки | `config.chunks` с группировкой по `shard`, поле `jumbo` | любой jumbo-чанк | чанк нельзя разделить и перенести |
+| Соответствие балансировщику | `sh.balancerCollectionStatus("shop.products")` | `balancerCompliant: false` дольше окна балансировки | балансировщик не справляется или выключен |
+| Миграции и их ошибки | `config.changelog`, `config.actionlog`: события `moveChunk.*`, `balancer.round` | ошибки миграций, миграции в пиковые часы | перемещения мешают нагрузке |
+
+**Запросы и их адресация**, источник `mongos` и коллекция:
+
+| Метрика | Как получить | Порог тревоги | О чём говорит |
+| :- | :- | :- | :- |
+| Адресация запросов | на `mongos`: `serverStatus().shardingStatistics.numHostsTargeted` | доля `allShards` и `manyShards` больше 30% для `find` | запросы не содержат шард-ключ, рассылка на все шарды |
+| Операции и задержка по коллекции на каждом шарде | `db.products.aggregate([{ $collStats: { latencyStats: {}, storageStats: {} } }])` | доля операций шарда в 1,5 раза больше доли документов | нагрузка на коллекцию сосредоточена на шарде |
+| Время по коллекциям на ноде | на `mongod` шарда: `db.adminCommand({ top: 1 })` | одна коллекция забирает больше 70% времени | какая коллекция греет шард |
+| Медленные запросы | профилировщик на шарде: `db.setProfilingLevel(1, { slowms: 100 })`, затем `system.profile` | рост числа медленных запросов | какие значения ключа горячие |
+
+Пример правил Prometheus для двух шардов, где средняя доля шарда равна 0,5:
+
+```yaml
+groups:
+  - name: mongodb-hot-shard
+    rules:
+      - alert: MongoShardLoadSkew
+        expr: |
+          sum by (rs_nm) (rate(mongodb_ss_opcounters{cl_role="shardsvr"}[5m]))
+            / scalar(sum(rate(mongodb_ss_opcounters{cl_role="shardsvr"}[5m]))) > 0.75
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Шард {{ $labels.rs_nm }} обрабатывает больше 75% операций кластера"
+      - alert: MongoShardReadLatency
+        expr: |
+          rate(mongodb_ss_opLatencies_latency{op_type="reads"}[5m])
+            / rate(mongodb_ss_opLatencies_ops{op_type="reads"}[5m]) > 50000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Средняя задержка чтения на {{ $labels.rs_nm }} выше 50 мс"
+      - alert: MongoReplicationLag
+        expr: mongodb_mongod_replset_member_replication_lag > 10
+        for: 2m
+        labels: { severity: critical }
+```
+
+### Порядок диагностики
+
+Первый вопрос при срабатывании тревоги: перекошены данные или перекошена нагрузка.
+Ответ дают две доли по каждому шарду, доля документов из `$shardedDataDistribution`
+и доля операций из `$collStats`.
+
+```js
+// доля операций и документов по шардам для коллекции
+const ns = "shop.products", [dbName, coll] = ns.split(".")
+const stats = db.getSiblingDB(dbName)[coll]
+  .aggregate([{ $collStats: { latencyStats: {}, storageStats: {} } }]).toArray()
+const ops = Object.fromEntries(stats.map(s => [s.shard, Number(s.latencyStats.reads.ops) + Number(s.latencyStats.writes.ops)]))
+const docs = Object.fromEntries(stats.map(s => [s.shard, s.storageStats.count]))
+const totalOps = Object.values(ops).reduce((a, b) => a + b, 0)
+const totalDocs = Object.values(docs).reduce((a, b) => a + b, 0)
+for (const shard of Object.keys(ops)) {
+  const opShare = ops[shard] / totalOps, docShare = docs[shard] / totalDocs
+  print(shard, "операций", (opShare * 100).toFixed(1) + "%", "документов", (docShare * 100).toFixed(1) + "%",
+    opShare > 1.5 * docShare ? "горячий" : "")
+}
+```
+
+Счётчики `$collStats` накапливаются с момента запуска процесса, поэтому в мониторинге
+берётся разница между двумя замерами, а не абсолютное значение.
+
+Дальше три варианта:
+
+1. **Перекошены данные.** Чанков или байт на шарде заметно больше. Причина в jumbo-чанках
+   или выключенном балансировщике. Лечится балансировщиком и ручным переносом, при
+   jumbo-чанках уточнением ключа.
+2. **Данные ровные, нагрузка нет.** Горячий диапазон ключа, как электроника. Нужно
+   узнать диапазон: профилировщик на горячем шарде и группировка `system.profile`
+   по значению ключа. Лечится зонами, уточнением ключа или решардингом.
+3. **Горячий один документ.** Один товар-хит, на который идут тысячи запросов в секунду.
+   Шардирование не поможет, документ всё равно лежит на одном шарде. Лечится кешем
+   в redis и чтением с secondary.
+
+```js
+// на горячем шарде: какие категории собирают медленные запросы
+db.setProfilingLevel(1, { slowms: 100 })
+db.system.profile.aggregate([
+  { $match: { ns: "shop.products", "command.filter.category": { $exists: true } } },
+  { $group: { _id: "$command.filter.category", n: { $sum: 1 }, ms: { $avg: "$millis" } } },
+  { $sort: { n: -1 } }
+])
+```
+
+### Меры устранения
+
+Меры перечислены от самой дешёвой к самой радикальной. Все команды проверены на стенде
+`mongo-sharding`, MongoDB 8.
+
+**1. Балансировщик и ручной перенос чанков.** Не меняет ключ, работает сразу.
+
+```js
+sh.getBalancerState()
+sh.balancerCollectionStatus("shop.products")
+
+// разделить чанк в нужной точке и перенести половину на другой шард
+sh.splitAt("shop.products", { category: "electronics", _id: ObjectId("6aaf03816d86d6f1582639a6") })
+sh.moveRange("shop.products", "shard2", { category: "electronics", _id: MinKey })
+
+// снять флаг jumbo, если чанк уже можно разделить
+db.adminCommand({ clearJumboFlag: "shop.products", find: { category: "electronics" } })
+```
+
+Ограничение: при ключе `{ category: 1 }` категория это один чанк с одним значением ключа,
+`splitAt` внутри него невозможен. Поэтому первым делом ключ уточняется.
+
+**2. Уточнение ключа `refineCollectionShardKey`.** К существующему ключу добавляется
+суффикс, данные не перемещаются, запросы по категории остаются точечными, но чанк
+категории теперь можно резать по `_id`.
+
+```js
+db.products.createIndex({ category: 1, _id: 1 })
+db.adminCommand({ refineCollectionShardKey: "shop.products", key: { category: 1, _id: 1 } })
+```
+
+После уточнения балансировщик или `moveRange` раскладывают чанки электроники
+по нескольким шардам.
+
+**3. Зоны для горячей категории.** Диапазон электроники закрепляется за зоной из
+нескольких шардов, остальные категории живут где угодно. Балансировщик сам держит
+чанки зоны только на её шардах и выравнивает их между собой. Под зону можно выделить
+шарды с более сильным железом.
+
+```js
+sh.addShardToZone("shard1", "hot")
+sh.addShardToZone("shard2", "hot")
+sh.updateZoneKeyRange("shop.products",
+  { category: "electronics", _id: MinKey },
+  { category: "electronics", _id: MaxKey }, "hot")
+
+// проверка
+db.getSiblingDB("config").tags.find({ ns: "shop.products" })
+```
+
+**4. Решардинг на хешированный `_id`.** Целевое решение из задания 7: товары любой
+категории размазываются по всем шардам, горячая категория перестаёт существовать
+как понятие. Цена: поиск по категории уходит на все шарды, это компенсируется
+индексом `{ category: 1, price: 1 }` и кешем каталога.
+
+```js
+// зоны старого ключа нужно снять заранее, иначе команда попросит поле zones
+sh.removeRangeFromZone("shop.products",
+  { category: "electronics", _id: MinKey }, { category: "electronics", _id: MaxKey })
+
+db.adminCommand({ reshardCollection: "shop.products", key: { _id: "hashed" }, numInitialChunks: 4 })
+
+// ход операции: состояние и оценка оставшегося времени по каждому шарду
+db.getSiblingDB("admin").aggregate([
+  { $currentOp: { allUsers: true, localOps: false } },
+  { $match: { type: "op", "originatingCommand.reshardCollection": "shop.products" } }
+])
+```
+
+Что учесть: на шардах нужно свободное место примерно в 1,2 объёма коллекции, операция
+по умолчанию длится не меньше 5 минут (параметр `reshardingMinimumOperationDurationMillis`),
+в момент фиксации запись блокируется на секунды. Запускать в окно низкой нагрузки,
+до распродажи, а не во время неё. На стенде решардинг 5000 документов занял 334 секунды
+и дал распределение 2437 и 2563 документа. С версии 7.0 есть
+`reshardCollection` с `forceRedistribution: true`: тот же ключ, но данные заново
+раскладываются по шардам, полезно после добавления шарда.
+
+**5. Масштабирование горячего шарда.** Если перенос данных невозможен здесь и сейчас:
+
+- добавить secondary в replica set горячего шарда и увести на них чтение каталога
+  через `readPreference: secondaryPreferred`, подробнее в задании 9;
+- поднять железо шарда вертикально;
+- добавить шард командой `sh.addShard()`, при хешированном ключе балансировщик перенесёт
+  на него только свою долю чанков, а не перераскладывает всё.
+
+**6. Уровень приложения.** Кеш страниц каталога горячих категорий в redis с TTL
+в десятки секунд, кеш карточек товаров-хитов, ограничение частоты запросов на
+API Gateway. Эти меры снимают нагрузку с шардов до того, как запрос дошёл до MongoDB.
+
+### Автоматическое перераспределение
+
+Встроенный механизм автоматики один, балансировщик. Его настройки под распродажу:
+
+```js
+// балансировщик включён, миграции только ночью, чтобы не конкурировать с пиком
+sh.startBalancer()
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "balancer" },
+  { $set: { activeWindow: { start: "02:00", stop: "06:00" } } },
+  { upsert: true }
+)
+// размер чанка 64 МБ вместо 128: мельче гранулярность переноса
+db.getSiblingDB("config").settings.updateOne({ _id: "chunksize" }, { $set: { value: 64 } }, { upsert: true })
+// автослияние мелких чанков, MongoDB 7.0 и новее
+sh.startAutoMerger()
+// щадящая миграция: ждать подтверждения secondary и удаления с донора
+sh.moveRange("shop.products", "shard2", { _id: MinKey }, { secondaryThrottle: true, waitForDelete: true })
+```
+
+Балансировщик выравнивает данные, а не нагрузку, поэтому поверх него работает
+автоматика по тревогам. Тревога `MongoShardLoadSkew` запускает задание, которое:
+
+1. Считает доли операций и документов по шардам скриптом из раздела диагностики.
+2. Если данные перекошены, ничего не делает и ждёт балансировщик, при выключенном
+   балансировщике включает его.
+3. Если данные ровные, а нагрузка нет, находит горячий диапазон по `system.profile`
+   и переносит по одному чанку этого диапазона с самого нагруженного шарда
+   на самый свободный, с паузой между переносами и только вне окна пика.
+4. Если после трёх переносов перекос сохраняется, эскалирует дежурному: нужен
+   решардинг или зона, это плановые операции, автоматика их не запускает.
+
+```js
+// перенос одного чанка горячего диапазона с горячего шарда на холодный
+function moveHotChunk(ns, hotShard, coldShard, category) {
+  const chunk = db.getSiblingDB("config").chunks.aggregate([
+    { $lookup: { from: "collections", localField: "uuid", foreignField: "uuid", as: "c" } },
+    { $unwind: "$c" },
+    { $match: { "c._id": ns, shard: hotShard, "min.category": category } },
+    { $limit: 1 }
+  ]).next()
+  if (!chunk) return print("на", hotShard, "нет чанков категории", category)
+  const res = sh.moveRange(ns, coldShard, chunk.min, { secondaryThrottle: true })
+  print("перенесён чанк", JSON.stringify(chunk.min), "на", coldShard, "ok:", res.ok)
+}
+moveHotChunk("shop.products", "shard1", "shard2", "electronics")
+```
+
+### Итог
+
+| Симптом | Метрика, по которой виден | Действие |
+| :- | :- | :- |
+| Один шард держит большую часть операций при ровных данных | доля `opcounters` и `$collStats` против доли документов | зона под горячий диапазон или решардинг на хеш |
+| Чанки категории не делятся, есть jumbo | `config.chunks` с `jumbo: true` | `refineCollectionShardKey`, затем `splitAt` и `moveRange` |
+| Данные перекошены, миграций нет | `$shardedDataDistribution`, `balancerCollectionStatus` | включить балансировщик, проверить окно и ошибки в `changelog` |
+| Много запросов на все шарды | `numHostsTargeted.allShards` на `mongos` | добавить шард-ключ в запросы, пересмотреть ключ |
+| Растут задержки и очереди на шарде | `opLatencies`, `queues.execution`, отставание реплик | чтение с secondary, кеш, вертикальное масштабирование |
+| Один товар собирает нагрузку | `system.profile` по `_id` | кеш в redis, шардирование не поможет |
+
+Предотвращение на будущее: ключи выбираются с учётом распределения нагрузки, а не только
+данных, как в задании 7; коллекции создаются с предварительным разбиением
+(`numInitialChunks`) под хешированный ключ; перед распродажей проводится нагрузочный
+тест с реальным перекосом по категориям; пороги тревог по перекосу настроены заранее.
