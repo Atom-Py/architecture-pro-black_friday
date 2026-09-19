@@ -1,0 +1,75 @@
+name: mongo-sharding
+
+# Общие настройки нод MongoDB: образ, политика перезапуска, проверка готовности
+x-mongo: &mongo
+  image: mongo:8
+  restart: always
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - mongosh --port $${MONGO_PORT} --quiet --eval "db.adminCommand('ping').ok"
+    interval: 5s
+    timeout: 5s
+    retries: 10
+    start_period: 10s
+
+services:
+
+  # Config server: хранит метаданные кластера, какие чанки лежат на каких шардах
+  configSrv:
+    <<: *mongo
+    environment:
+      MONGO_PORT: 27019
+    command: ["mongod", "--configsvr", "--replSet", "config_server", "--bind_ip_all", "--port", "27019"]
+    volumes:
+      - configSrv_data:/data/db
+
+  # Шарды: каждый хранит свою часть данных
+  shard1:
+    <<: *mongo
+    environment:
+      MONGO_PORT: 27018
+    command: ["mongod", "--shardsvr", "--replSet", "shard1", "--bind_ip_all", "--port", "27018"]
+    volumes:
+      - shard1_data:/data/db
+
+  shard2:
+    <<: *mongo
+    environment:
+      MONGO_PORT: 27018
+    command: ["mongod", "--shardsvr", "--replSet", "shard2", "--bind_ip_all", "--port", "27018"]
+    volumes:
+      - shard2_data:/data/db
+
+  # Маршрутизатор: единая точка входа для приложения
+  mongos_router:
+    <<: *mongo
+    environment:
+      MONGO_PORT: 27017
+    command: ["mongos", "--configdb", "config_server/configSrv:27019", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    depends_on:
+      configSrv:
+        condition: service_healthy
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
+
+  pymongo_api:
+    image: kazhem/pymongo_api:1.0.0
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      MONGODB_URL: "mongodb://mongos_router:27017"
+      MONGODB_DATABASE_NAME: "somedb"
+    depends_on:
+      mongos_router:
+        condition: service_started
+
+volumes:
+  configSrv_data:
+  shard1_data:
+  shard2_data:
